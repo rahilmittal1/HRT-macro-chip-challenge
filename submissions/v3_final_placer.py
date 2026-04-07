@@ -50,11 +50,20 @@ class V3FinalPlacer:
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
         plc = self._load_plc(benchmark)
+        movable_mask = benchmark.get_movable_mask() & benchmark.get_hard_macro_mask()
+        init_pos = benchmark.macro_positions.clone()
+        return self._optimize_once(
+            init_pos, benchmark, plc, movable_mask,
+            self.num_steps, verbose=True,
+        )
+
+    def _optimize_once(self, init_pos, benchmark, plc, movable_mask,
+                       num_steps, verbose=False):
+        """Single optimization run from given initial positions."""
         sizes = benchmark.macro_sizes
         cw, ch = benchmark.canvas_width, benchmark.canvas_height
         num_hard = benchmark.num_hard_macros
         num_macros = benchmark.num_macros
-        movable_mask = benchmark.get_movable_mask() & benchmark.get_hard_macro_mask()
 
         half_w = sizes[:, 0] / 2
         half_h = sizes[:, 1] / 2
@@ -65,27 +74,22 @@ class V3FinalPlacer:
         grid_h_routes = gh * benchmark.hroutes_per_micron
         grid_v_routes = gw * benchmark.vroutes_per_micron
 
-        # ── Net data ──────────────────────────────────────────────────────
         net_data = self._extract_nets(benchmark, plc)
 
-        # ── Grid cell boundaries ──────────────────────────────────────────
         cell_x_lo = torch.arange(grid_cols, dtype=torch.float32) * gw
         cell_x_hi = cell_x_lo + gw
         cell_y_lo = torch.arange(grid_rows, dtype=torch.float32) * gh
         cell_y_hi = cell_y_lo + gh
 
-        # ── Optimisable positions ─────────────────────────────────────────
-        positions = benchmark.macro_positions.clone().requires_grad_(True)
+        positions = init_pos.clone().requires_grad_(True)
         fixed_pos = benchmark.macro_positions.clone()
         optimizer = torch.optim.Adam([positions], lr=self.lr)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=self.num_steps, eta_min=self.lr * 0.1)
+            optimizer, T_max=num_steps, eta_min=self.lr * 0.1)
 
-        # ── TILOS heatmap (updated every 100 steps) ──────────────────────
         cong_map = torch.zeros(grid_rows, grid_cols)
 
-        NS = self.num_steps
-
+        NS = num_steps
         for step in range(NS):
             optimizer.zero_grad()
 
@@ -97,47 +101,34 @@ class V3FinalPlacer:
             frac = step / NS
             gamma = 5.0 + 15.0 * frac
 
-            # ── HPWL ────────────────────────────────────────────────────
             wl_loss, net_bboxes = self._hpwl_loss_with_bbox(
                 pos, net_data, cw, ch, gamma,
             )
-
-            # ── Density ─────────────────────────────────────────────────
             den_loss = self._density_loss(
                 pos, sizes, num_macros,
                 cell_x_lo, cell_x_hi, cell_y_lo, cell_y_hi, cell_area,
                 grid_rows, grid_cols,
             )
-
-            # ── RUDY congestion ─────────────────────────────────────────
             rudy_loss = self._rudy_loss(
                 net_bboxes, net_data,
                 cell_x_lo, cell_x_hi, cell_y_lo, cell_y_hi,
                 grid_rows, grid_cols,
                 grid_h_routes, grid_v_routes,
             )
-
-            # ── Overlap ─────────────────────────────────────────────────
             ovlp_loss = self._overlap_loss(pos, sizes, num_hard)
-
-            # ── TILOS heatmap congestion ────────────────────────────────
             tilos_cong = self._tilos_cong_loss(
                 pos, cong_map, movable_mask,
                 grid_rows, grid_cols, gw, gh,
             )
 
-            # ══ Task 1: Gradient Diagnostics ═════════════════════════════
-            if step == 0:
+            if step == 0 and verbose:
                 self._print_gradient_diagnostics(
                     wl_loss, den_loss, rudy_loss, positions, movable_mask,
                 )
 
-            # ── Scheduled weights ────────────────────────────────────────
             lam_den = self.lam_den_start + (self.lam_den_end - self.lam_den_start) * frac
             lam_rudy = self.lam_cong_start + (self.lam_cong_end - self.lam_cong_start) * frac
             lam_tilos = 0.5 * min(1.0, frac * 2.5)
-
-            # ══ Overlap penalty (constant — soft-to-hard tested and regressed) ═
             lam_ovlp = 10.0
 
             loss = (wl_loss
@@ -148,8 +139,7 @@ class V3FinalPlacer:
 
             loss.backward()
 
-            # ── Diagnostics for first 10 steps ──────────────────────────
-            if step < 10:
+            if step < 10 and verbose:
                 with torch.no_grad():
                     gn = positions.grad[movable_mask].norm().item() if positions.grad is not None else 0
                     print(f"  [step {step:3d}] loss={loss.item():.4f} "
@@ -169,7 +159,6 @@ class V3FinalPlacer:
             with torch.no_grad():
                 positions[~movable_mask] = fixed_pos[~movable_mask]
 
-            # ── TILOS feedback every 100 steps ──────────────────────────
             if plc is not None and (step + 1) % 100 == 0:
                 with torch.no_grad():
                     snap = positions.detach().clone()
@@ -180,17 +169,17 @@ class V3FinalPlacer:
                     h_cong = torch.tensor(plc.H_routing_cong, dtype=torch.float32)
                     cong_map = torch.max(v_cong, h_cong).reshape(grid_rows, grid_cols)
 
-        # ── Clamp + Wire-Aware Legalize ───────────────────────────────────
+        # Clamp + Legalize
         final = positions.detach().clone()
         final[:, 0] = torch.clamp(final[:, 0], min=half_w, max=cw - half_w)
         final[:, 1] = torch.clamp(final[:, 1], min=half_h, max=ch - half_h)
-        final = self._legalize(final, benchmark)
+        final = self._legalize(final, benchmark, cong_map)
 
-        # ── Congestion-directed local search ──────────────────────────────
+        # Congestion-directed local search
         if plc is not None:
             final = self._cong_local_search(final, benchmark, plc, movable_mask)
 
-        # ── Stochastic swap refinement ────────────────────────────────────
+        # Stochastic swap refinement
         if plc is not None:
             final = self._stochastic_swap(final, benchmark, plc, movable_mask)
 
@@ -402,30 +391,57 @@ class V3FinalPlacer:
         return sampled.squeeze().mean()
 
     # ═══════════════════════════════════════════════════════════════════════
-    # Spiral legalization (proven, minimal disruption)
+    # Congestion-aware spiral legalization
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _legalize(self, placement, benchmark):
+    def _legalize(self, placement, benchmark, cong_map=None):
+        """Spiral legalization with congestion-aware candidate scoring.
+
+        When a macro needs displacement, collect the first K valid candidates
+        from the spiral and pick the one with lowest:
+            score = distance + alpha * congestion_at_position
+        This steers macros AWAY from congested cells during legalization.
+        """
         sizes = benchmark.macro_sizes
         cw, ch = benchmark.canvas_width, benchmark.canvas_height
+        grid_rows, grid_cols = benchmark.grid_rows, benchmark.grid_cols
+        gw, gh = cw / grid_cols, ch / grid_rows
         movable = benchmark.get_movable_mask() & benchmark.get_hard_macro_mask()
         movable_idx = torch.where(movable)[0].tolist()
         movable_idx.sort(key=lambda i: -(sizes[i, 0].item() * sizes[i, 1].item()))
         gap = 0.01
         placed = []
+        K = 1  # nearest first valid (K>1 regressed on ibm01)
+        diag = math.sqrt(cw**2 + ch**2)
+        # alpha controls congestion vs distance tradeoff
+        alpha = 0.0  # Disabled: congestion-aware scoring regressed on ibm01/06
+
+        def cong_at(px, py):
+            if alpha == 0:
+                return 0.0
+            c = min(grid_cols - 1, max(0, int(px / gw)))
+            r = min(grid_rows - 1, max(0, int(py / gh)))
+            return cong_map[r, c].item()
+
         for idx in movable_idx:
             x, y = placement[idx, 0].item(), placement[idx, 1].item()
             w, h = sizes[idx, 0].item(), sizes[idx, 1].item()
             hw, hh = w / 2, h / 2
             x = max(hw, min(cw - hw, x))
             y = max(hh, min(ch - hh, y))
+
+            # Check original position
             if not self._overlaps(x, y, w, h, placed, gap):
                 placement[idx, 0] = x
                 placement[idx, 1] = y
                 placed.append((idx, x, y, w, h))
                 continue
-            found = False
+
+            # Collect up to K non-overlapping candidates from spiral
+            candidates = []
             for rs in range(1, 400):
+                if len(candidates) >= K:
+                    break
                 r = rs * 0.2
                 na = max(8, rs * 4)
                 for ai in range(na):
@@ -435,15 +451,21 @@ class V3FinalPlacer:
                     nx = max(hw, min(cw - hw, nx))
                     ny = max(hh, min(ch - hh, ny))
                     if not self._overlaps(nx, ny, w, h, placed, gap):
-                        placement[idx, 0] = nx
-                        placement[idx, 1] = ny
-                        placed.append((idx, nx, ny, w, h))
-                        found = True
-                        break
-                if found:
-                    break
-            if not found:
+                        dist = math.sqrt((nx - x)**2 + (ny - y)**2)
+                        score = dist + alpha * cong_at(nx, ny)
+                        candidates.append((score, nx, ny))
+                        if len(candidates) >= K:
+                            break
+
+            if candidates:
+                candidates.sort(key=lambda c: c[0])
+                _, bx, by = candidates[0]
+                placement[idx, 0] = bx
+                placement[idx, 1] = by
+                placed.append((idx, bx, by, w, h))
+            else:
                 placed.append((idx, x, y, w, h))
+
         return placement
 
     # ═══════════════════════════════════════════════════════════════════════
